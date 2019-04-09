@@ -28,19 +28,19 @@ struct vocab_mp{
     char *mp, *code, codelen, *inverse_mp;
 };
 
-char train_file[MAX_STRING], output_file[MAX_STRING], mp_output_file[MAX_STRING], type_file[MAX_STRING], tag_file[MAX_STRING];
+char train_file[MAX_STRING], output_file[MAX_STRING], mp_output_file[MAX_STRING], lat_file[MAX_STRING], lon_file[MAX_STRING];
 struct vocab_word *vocab;
 struct vocab_mp *mp_vocab;
 int binary = 0, debug_mode = 2, window = 5, num_threads = 1, is_deepwalk = 1, no_circle = 1, static_win = 1;
 int sigmoid_reg = 0;
-int *vocab_hash, *mp_vocab_hash, *node2type, *node2tag;
+int *vocab_hash, *mp_vocab_hash;
 long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 64;
 long long mp_vocab_max_size = 1000, mp_vocab_size = 0;
 long long train_words = 0, file_size = 0;
 long long train_mps = 0;
 real alpha = 0.025, starting_alpha, last_alpha = 0;
 real beta = 0.9;
-real *syn0, *syn1neg, *synmp, *expTable;
+real *syn0, *syn1neg, *synmp, *expTable, *node2lat, *node2lon;
 clock_t start;
 
 int negative = 5;
@@ -368,15 +368,15 @@ void LearnMpVocabFromTrainFile() {
     fclose(fin);
 }
 
-void LoadTypeFromTypeFile() {
+void LoadLatFromLatFile() {
     char word[MAX_STRING];
-    char type[MAX_STRING];
+    char latitude[MAX_STRING];
     FILE *fin;
     int i;
-    for (long long a = 0; a < vocab_hash_size; a++) node2type[a] = -1;
-    fin = fopen(type_file, "rb");
+    for (long long a = 0; a < vocab_hash_size; a++) node2lat[a] = -1;
+    fin = fopen(lat_file, "rb");
     if (fin == NULL) {
-        printf("ERROR: type data file (%s) not found!\n", type_file);
+        printf("ERROR: type data file (%s) not found!\n", lat_file);
         exit(1);
     }
     while (1) {
@@ -387,23 +387,23 @@ void LoadTypeFromTypeFile() {
         if (strcmp(word, "\n") == 0) {
             continue;
         }
-        ReadWord(type, fin);
+        ReadWord(latitude, fin);
         i = SearchVocab(word);
-        node2type[i] = atoi(type);
+        node2lat[i] = atof(latitude);
 //        printf("node:%s(%d) type:%d\n", word, i, atoi(type));
     }
     fclose(fin);
 }
 
-void LoadTagFromTagFile() {
+void LoadLonFromLonFile() {
     char word[MAX_STRING];
-    char tag[MAX_STRING];
+    char longitude[MAX_STRING];
     FILE *fin;
     int i;
-    for (long long a = 0; a < vocab_hash_size; a++) node2tag[a] = -1;
-    fin = fopen(tag_file, "rb");
+    for (long long a = 0; a < vocab_hash_size; a++) node2lon[a] = -1;
+    fin = fopen(lon_file, "rb");
     if (fin == NULL) {
-        printf("ERROR: tag data file (%s) not found!\n", tag_file);
+        printf("ERROR: type data file (%s) not found!\n", lon_file);
         exit(1);
     }
     while (1) {
@@ -414,12 +414,32 @@ void LoadTagFromTagFile() {
         if (strcmp(word, "\n") == 0) {
             continue;
         }
-        ReadWord(tag, fin);
+        ReadWord(longitude, fin);
         i = SearchVocab(word);
-        node2tag[i] = atoi(tag);
+        node2lon[i] = atof(longitude);
 //        printf("node:%s(%d) type:%d\n", word, i, atoi(type));
     }
     fclose(fin);
+}
+
+// 角度转弧度
+double rad(double d) {
+    const double PI = 3.1415926535898;
+    return d * PI / 180.0;
+}
+
+// 传入两个经纬度，计算之间的大致直线距离
+int CalcDistance(float fLati1, float fLong1, float fLati2, float fLong2) {
+    const float EARTH_RADIUS = 6378.137;
+
+    double radLat1 = rad(fLati1);
+    double radLat2 = rad(fLati2);
+    double a = radLat1 - radLat2;
+    double b = rad(fLong1) - rad(fLong2);
+    double s = 2 * asin(sqrt(pow(sin(a/2),2) + cos(radLat1)*cos(radLat2)*pow(sin(b/2),2)));
+    s = s * EARTH_RADIUS;
+    s = (int)(s * 10000000) / 10000;
+    return s;
 }
 
 void InitNet() {
@@ -636,13 +656,17 @@ void *TrainModelThread(void *id) {
                 context = node_seq[a+w];
                 mp_index = 0;
 
+                real lat1 = node2lat[target];
+                real lon1 = node2lon[target];
+
                 next_random = next_random * (unsigned long long)25214903917 + 11;
                 for (d = 0; d < negative + 1; d++) {
                     if (d == 0) {
                         label = 0;
-                        if (node2type[target] == 1) label = 0;
-                        else if (node2type[target] == node2type[context]) label += 0.5;
-                        if (node2tag[target] == node2tag[context]) label += 0.5;
+                        real lat2 = node2lat[context];
+                        real lon2 = node2lon[context];
+                        int dis = CalcDistance(lat1, lon1, lat2, lon2);
+                        if (dis <= 500) label = 1;
                         // negative sampling
                     } else {
                         next_random = next_random * (unsigned long long)25214903917 + 11;
@@ -650,9 +674,10 @@ void *TrainModelThread(void *id) {
                         if (context == 0) context = next_random % (vocab_size - 1) + 1;
                         if (context == target || context == node_seq[a+w]) continue;
                         label = 0;
-                        if (node2type[target] == 1) label = 0;
-                        else if (node2type[target] == node2type[context]) label += 0.5;
-                        if (node2tag[target] == node2tag[context]) label += 0.5;
+                        real lat2 = node2lat[context];
+                        real lon2 = node2lon[context];
+                        int dis = CalcDistance(lat1, lon1, lat2, lon2);
+                        if (dis <= 500) label = 1;
                     }
 
                     // training of a data
@@ -729,8 +754,8 @@ void TrainModel() {
     last_alpha = alpha;
     LearnVocabFromTrainFile(); // 从输入的node sequence 里提取node的信息
     LearnMpVocabFromTrainFile();//
-    LoadTypeFromTypeFile();//提取node type
-    LoadTagFromTagFile();//提取node tag
+    LoadLatFromLatFile();//提取node latitude
+    LoadLonFromLonFile();//提取node lontitude
     if (output_file[0] == 0) return;
     InitNet();
     InitUnigramTable(); //一元表，负采样
@@ -814,10 +839,10 @@ int main(int argc, char **argv) {
         printf("\t\tSet size of vectors dimension; default is 64\n");
         printf("\t-train <file>\n");
         printf("\t\tUse text data from <file> to train the model, format of line is '<node_id> <edge_class>'\n");
-        printf("\t-type_file <file>\n");
-        printf("\t\tNode type file, format of line is '<node_id> <node_type>'\n");
-        printf("\t-tag_file <file>\n");
-        printf("\t\tNode tag file, format of line is '<node_id> <node_tag>'\n");
+        printf("\t-lat_file <file>\n");
+        printf("\t\tNode latitude file, format of line is '<node_id> <latitude_value>'\n");
+        printf("\t-lon_file <file>\n");
+        printf("\t\tNode longitude file, format of line is '<node_id> <longitude_tag>'\n");
         printf("\t-alpha <float>\n");
         printf("\t\tSet the starting learning rate; default is 0.025\n");
         printf("\t-beta <float>\n");
@@ -837,14 +862,14 @@ int main(int argc, char **argv) {
         printf("\t-no_circle <1/0>\n");
         printf("\t\tSet to agoid circles in paths when preparing training data (default 1: avoid)\n");
         printf("\nExamples:\n");
-        printf("./road2vec -train data.txt -type_file type.txt -tag_file tag.txt -output vec.txt -output_mp mp.txt -size 128 -window 5 -negative 5\n\n");
+        printf("./road2vec -train data.txt -lat_file lat.txt -lon_file lon.txt -output vec.txt -output_mp mp.txt -size 128 -window 5 -negative 5\n\n");
         return 0;
     }
     output_file[0] = 0;
     if ((i = ArgPos((char *)"-size", argc, argv)) > 0) layer1_size = atoi(argv[i + 1]);
     if ((i = ArgPos((char *)"-train", argc, argv)) > 0) strcpy(train_file, argv[i + 1]);
-    if ((i = ArgPos((char *)"-type_file", argc, argv)) > 0) strcpy(type_file, argv[i + 1]);
-    if ((i = ArgPos((char *)"-tag_file", argc, argv)) > 0) strcpy(tag_file, argv[i + 1]);
+    if ((i = ArgPos((char *)"-lat_file", argc, argv)) > 0) strcpy(lat_file, argv[i + 1]);
+    if ((i = ArgPos((char *)"-lon_file", argc, argv)) > 0) strcpy(lon_file, argv[i + 1]);
     if ((i = ArgPos((char *)"-alpha", argc, argv)) > 0) alpha = atof(argv[i + 1]);
     if ((i = ArgPos((char *)"-beta", argc, argv)) > 0) beta = atof(argv[i + 1]);
     if ((i = ArgPos((char *)"-output", argc, argv)) > 0) strcpy(output_file, argv[i + 1]);
@@ -857,8 +882,8 @@ int main(int argc, char **argv) {
 
     vocab = (struct vocab_word *)calloc(vocab_max_size, sizeof(struct vocab_word));
     vocab_hash = (int *)calloc(vocab_hash_size, sizeof(int));
-    node2type = (int *)calloc(vocab_hash_size, sizeof(int));
-    node2tag = (int *)calloc(vocab_hash_size, sizeof(int));
+    node2lat = (int *)calloc(vocab_hash_size, sizeof(real));
+    node2lon = (int *)calloc(vocab_hash_size, sizeof(real));
     mp_vocab = (struct vocab_mp*)calloc(mp_vocab_max_size, sizeof(struct vocab_mp));
     mp_vocab_hash = (int *)calloc(mp_vocab_hash_size, sizeof(int));
 
@@ -876,8 +901,8 @@ int main(int argc, char **argv) {
     DestroyNet();
     free(vocab_hash);
     free(mp_vocab_hash);
-    free(node2type);
-    free(node2tag);
+    free(node2lat);
+    free(node2lon);
     free(expTable);
     return 0;
 }
