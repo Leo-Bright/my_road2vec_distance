@@ -679,7 +679,7 @@ void *TrainModelThread(void *id) {
 
                 //Learn by same node type relationship
 
-                if(only == 1){
+                if(only == 0){ // 0 if defalt false ,
                     target = node_seq[a];
                     context = node_seq[a+w];
                     mp_index = 0;
@@ -864,9 +864,9 @@ void TrainModel() {
     LoadLatFromLatFile();//提取node latitude
     LoadLonFromLonFile();//提取node lontitude
     if (only == 1) {
-        printf("training distance with type \n");
-    } else{
         printf("training distance without type \n");
+    } else{
+        printf("training distance with type \n");
     }
     if (output_file[0] == 0) return;
     InitNet();
