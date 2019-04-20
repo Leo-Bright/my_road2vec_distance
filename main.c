@@ -28,12 +28,12 @@ struct vocab_mp{
     char *mp, *code, codelen, *inverse_mp;
 };
 
-char train_file[MAX_STRING], output_file[MAX_STRING], mp_output_file[MAX_STRING], lat_file[MAX_STRING], lon_file[MAX_STRING];
+char train_file[MAX_STRING], output_file[MAX_STRING], mp_output_file[MAX_STRING], type_file[MAX_STRING], lat_file[MAX_STRING], lon_file[MAX_STRING];
 struct vocab_word *vocab;
 struct vocab_mp *mp_vocab;
 int binary = 0, debug_mode = 2, window = 5, num_threads = 1, is_deepwalk = 1, no_circle = 1, static_win = 1;
-int sigmoid_reg = 0;
-int *vocab_hash, *mp_vocab_hash;
+int sigmoid_reg = 0, only = 0, distance = 500;
+int *vocab_hash, *mp_vocab_hash, *node2type;
 long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 64;
 long long mp_vocab_max_size = 1000, mp_vocab_size = 0;
 long long train_words = 0, file_size = 0;
@@ -295,6 +295,33 @@ void LearnVocabFromTrainFile() {
         printf("Nodes in train file: %lld\n", train_words);
     }
     file_size = ftell(fin);
+    fclose(fin);
+}
+
+void LoadTypeFromTypeFile() {
+    char word[MAX_STRING];
+    char type[MAX_STRING];
+    FILE *fin;
+    int i;
+    for (long long a = 0; a < vocab_hash_size; a++) node2type[a] = -1;
+    fin = fopen(type_file, "rb");
+    if (fin == NULL) {
+        printf("ERROR: type data file (%s) not found!\n", type_file);
+        exit(1);
+    }
+    while (1) {
+        ReadWord(word, fin);
+        if (feof(fin)) {
+            break;
+        }
+        if (strcmp(word, "\n") == 0) {
+            continue;
+        }
+        ReadWord(type, fin);
+        i = SearchVocab(word);
+        node2type[i] = atoi(type);
+//        printf("node:%s(%d) type:%d\n", word, i, atoi(type));
+    }
     fclose(fin);
 }
 
@@ -652,6 +679,85 @@ void *TrainModelThread(void *id) {
 
                 //Learn by same node type relationship
 
+                if(only == 1){
+                    target = node_seq[a];
+                    context = node_seq[a+w];
+                    mp_index = 0;
+
+                    next_random = next_random * (unsigned long long)25214903917 + 11;
+                    for (d = 0; d < negative + 1; d++) {
+                        if (d == 0) {
+                            label = 0;
+                            if (node2type[target] == node2type[context]) label = 1;
+                            if (node2type[target] == 1) label = 0;
+                            // negative sampling
+                        } else {
+                            next_random = next_random * (unsigned long long)25214903917 + 11;
+                            context = table[(next_random >> 16) % table_size];
+                            if (context == 0) context = next_random % (vocab_size - 1) + 1;
+                            if (context == target || context == node_seq[a+w]) continue;
+                            label = 0;
+                            if (node2type[target] == node2type[context]) label = 1;
+                            if (node2type[target] == 1) label = 0;
+                        }
+
+                        // training of a data
+                        lx = target * layer1_size;
+                        ly = context * layer1_size;
+                        lr = mp_index * layer1_size;
+                        for (c = 0; c < layer1_size; c++) ex[c] = 0;
+                        for (c = 0; c < layer1_size; c++) er[c] = 0;
+
+                        f = 0;
+                        for (c = 0; c < layer1_size; c++) {
+                            if (sigmoid_reg) {
+                                if (synmp[c + lr] > MAX_EXP) f += syn0[c + lx] * syn0[c + ly];
+                                else if (synmp[c + lr] < -MAX_EXP) continue;
+                                else f += syn0[c + lx] * syn0[c + ly] * expTable[(int)((synmp[c + lr] + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))];
+                            } else {
+                                if (synmp[c + lr] >= 0) f += syn0[c + lx] * syn0[c + ly];
+                            }
+                        }
+                        if (f > MAX_EXP) g = (label - 1) * alpha;
+                        else if (f < -MAX_EXP) g = (label - 0) * alpha;
+                        else g = (label - expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]) * alpha;
+
+                        g = g * (1.0 - beta);
+
+                        // update
+                        for (c = 0; c < layer1_size; c++) {
+                            if (sigmoid_reg) {
+                                if (synmp[c + lr] > MAX_EXP) ex[c] = g * syn0[c + ly];
+                                else if (synmp[c + lr] < -MAX_EXP) continue;
+                                else ex[c] = g * syn0[c + ly] * expTable[(int)((synmp[c + lr] + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))];
+                            } else {
+                                if (synmp[c + lr] >= 0) ex[c] = g * syn0[c + ly];
+                            }
+                        }
+                        for (c = 0; c < layer1_size; c++) {
+                            f = synmp[c + lr];
+                            if (f > MAX_EXP || f < -MAX_EXP) continue;
+                            sigmoid = expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))];
+                            er[c] = g * syn0[c + lx] * syn0[c + ly] * sigmoid * (1-sigmoid);
+                        }
+                        for (c = 0; c < layer1_size; c++) {
+                            if (sigmoid_reg) {
+                                if (synmp[c + lr] > MAX_EXP) syn0[c + ly] += g * syn0[c + lx];
+                                else if (synmp[c + lr] < -MAX_EXP) continue;
+                                else syn0[c + ly] += g * syn0[c + lx] * expTable[(int)((synmp[c + lr] + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))];
+                            } else {
+                                if (synmp[c + lr] >= 0) syn0[c + ly] += g * syn0[c + lx];
+                            }
+                        }
+                        for (c = 0; c < layer1_size; c++) syn0[c + lx] += ex[c];
+
+                        if (is_deepwalk == 0) {for (c = 0; c < layer1_size; c++) synmp[c + lr] += er[c];}
+                    }
+                }
+
+
+                //Learn by distance between two node
+
                 target = node_seq[a];
                 context = node_seq[a+w];
                 mp_index = 0;
@@ -666,7 +772,7 @@ void *TrainModelThread(void *id) {
                         real lat2 = node2lat[context];
                         real lon2 = node2lon[context];
                         int dis = CalcDistance(lat1, lon1, lat2, lon2);
-                        if (dis <= 500) label = 1;
+                        if (dis <= distance) label = 1;
                         // negative sampling
                     } else {
                         next_random = next_random * (unsigned long long)25214903917 + 11;
@@ -677,7 +783,7 @@ void *TrainModelThread(void *id) {
                         real lat2 = node2lat[context];
                         real lon2 = node2lon[context];
                         int dis = CalcDistance(lat1, lon1, lat2, lon2);
-                        if (dis <= 500) label = 1;
+                        if (dis <= distance) label = 1;
                     }
 
                     // training of a data
@@ -753,9 +859,15 @@ void TrainModel() {
     starting_alpha = alpha;
     last_alpha = alpha;
     LearnVocabFromTrainFile(); // 从输入的node sequence 里提取node的信息
+    LoadTypeFromTypeFile();//提取node type
     LearnMpVocabFromTrainFile();//
     LoadLatFromLatFile();//提取node latitude
     LoadLonFromLonFile();//提取node lontitude
+    if (only == 1) {
+        printf("training distance with type \n");
+    } else{
+        printf("training distance without type \n");
+    }
     if (output_file[0] == 0) return;
     InitNet();
     InitUnigramTable(); //一元表，负采样
@@ -843,6 +955,10 @@ int main(int argc, char **argv) {
         printf("\t\tNode latitude file, format of line is '<node_id> <latitude_value>'\n");
         printf("\t-lon_file <file>\n");
         printf("\t\tNode longitude file, format of line is '<node_id> <longitude_tag>'\n");
+        printf("\t-only <int>\n");
+        printf("\t\ttraining without type? default is false(0 is false, 1 is true).\n");
+        printf("\t-distance <int>\n");
+        printf("\t\tthe distance want to learning? default is 500.\n");
         printf("\t-alpha <float>\n");
         printf("\t\tSet the starting learning rate; default is 0.025\n");
         printf("\t-beta <float>\n");
@@ -868,6 +984,9 @@ int main(int argc, char **argv) {
     output_file[0] = 0;
     if ((i = ArgPos((char *)"-size", argc, argv)) > 0) layer1_size = atoi(argv[i + 1]);
     if ((i = ArgPos((char *)"-train", argc, argv)) > 0) strcpy(train_file, argv[i + 1]);
+    if ((i = ArgPos((char *)"-type_file", argc, argv)) > 0) strcpy(type_file, argv[i + 1]);
+    if ((i = ArgPos((char *)"-only", argc, argv)) > 0) only = atoi(argv[i + 1]);
+    if ((i = ArgPos((char *)"-distance", argc, argv)) > 0) distance = atoi(argv[i + 1]);
     if ((i = ArgPos((char *)"-lat_file", argc, argv)) > 0) strcpy(lat_file, argv[i + 1]);
     if ((i = ArgPos((char *)"-lon_file", argc, argv)) > 0) strcpy(lon_file, argv[i + 1]);
     if ((i = ArgPos((char *)"-alpha", argc, argv)) > 0) alpha = atof(argv[i + 1]);
@@ -882,6 +1001,7 @@ int main(int argc, char **argv) {
 
     vocab = (struct vocab_word *)calloc(vocab_max_size, sizeof(struct vocab_word));
     vocab_hash = (int *)calloc(vocab_hash_size, sizeof(int));
+    node2type = (int *)calloc(vocab_hash_size, sizeof(int));
     node2lat = (int *)calloc(vocab_hash_size, sizeof(real));
     node2lon = (int *)calloc(vocab_hash_size, sizeof(real));
     mp_vocab = (struct vocab_mp*)calloc(mp_vocab_max_size, sizeof(struct vocab_mp));
@@ -901,6 +1021,7 @@ int main(int argc, char **argv) {
     DestroyNet();
     free(vocab_hash);
     free(mp_vocab_hash);
+    free(node2type);
     free(node2lat);
     free(node2lon);
     free(expTable);
